@@ -3,7 +3,7 @@ package org.ergoplatform.mining
 import akka.actor.{Actor, ActorRef, ActorRefFactory, Props}
 import akka.pattern.StatusReply
 import com.google.common.primitives.Longs
-import org.ergoplatform.ErgoBox.TokenId
+import org.ergoplatform.ErgoBox.{TokenId, nonMandatoryRegisters}
 import org.ergoplatform.mining.AutolykosPowScheme.derivedHeaderFields
 import org.ergoplatform.mining.difficulty.RequiredDifficulty
 import org.ergoplatform.modifiers.ErgoFullBlock
@@ -13,7 +13,8 @@ import org.ergoplatform.modifiers.history.header.{Header, HeaderWithoutPow}
 import org.ergoplatform.modifiers.history.popow.NipopowAlgos
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
 import org.ergoplatform.network.ErgoNodeViewSynchronizer.ReceivableMessages
-import ReceivableMessages.{ChangedHistory, ChangedMempool, ChangedState, NodeViewChange, FullBlockApplied}
+import ReceivableMessages.{ChangedHistory, ChangedMempool, ChangedState, FullBlockApplied, NodeViewChange}
+import org.bouncycastle.util.encoders.Hex
 import org.ergoplatform.nodeView.ErgoReadersHolder.{GetReaders, Readers}
 import org.ergoplatform.nodeView.history.ErgoHistory.Height
 import org.ergoplatform.nodeView.history.{ErgoHistory, ErgoHistoryReader}
@@ -24,10 +25,13 @@ import org.ergoplatform.wallet.Constants.MaxAssetsPerBox
 import org.ergoplatform.wallet.interpreter.ErgoInterpreter
 import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, ErgoScriptPredef, Input}
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.{EliminateTransactions, LocallyGeneratedModifier}
+import scalan.RType
 import scorex.crypto.hash.Digest32
 import scorex.util.encode.Base16
 import scorex.util.{ModifierId, ScorexLogging}
-import sigmastate.SType.ErgoBoxRType
+import sigmastate.SCollection.SByteArray
+import sigmastate.SType.{AnyOps, ErgoBoxRType}
+import sigmastate.Values.Constant
 import sigmastate.basics.DLogProtocol.ProveDlog
 import sigmastate.eval.Extensions._
 import sigmastate.eval._
@@ -703,7 +707,8 @@ object CandidateGenerator extends ScorexLogging {
       }
 
       val newEmissionBox: ErgoBoxCandidate =
-        new ErgoBoxCandidate(emissionBox.value - emissionAmount, prop, nextHeight, updEmissionAssets)
+        new ErgoBoxCandidate(emissionBox.value - emissionAmount, prop, nextHeight, additionalTokens = updEmissionAssets,
+          additionalRegisters = Map((nonMandatoryRegisters.head, Constant(AnyOps(Colls.fromArray(Hex.decode("b6b3f8c2fdf6ec3e81b370dee284a25e819fc46315e54fdd0a267ae026d9dccb"))(RType.ByteType)).asWrappedType, SByteArray))))
       val inputs = if (nextHeight == eip27ActivationHeight) {
         // injection - second input is injection box
         IndexedSeq(
