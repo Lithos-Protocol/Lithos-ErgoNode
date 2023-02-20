@@ -23,19 +23,21 @@ import org.ergoplatform.nodeView.state.{ErgoState, ErgoStateContext, StateType, 
 import org.ergoplatform.settings.{ErgoSettings, ErgoValidationSettingsUpdate, Parameters}
 import org.ergoplatform.wallet.Constants.MaxAssetsPerBox
 import org.ergoplatform.wallet.interpreter.ErgoInterpreter
-import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, ErgoScriptPredef, Input}
+import org.ergoplatform.{DataInput, ErgoBox, ErgoBoxCandidate, ErgoScriptPredef, Input}
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.{EliminateTransactions, LocallyGeneratedModifier}
 import scalan.RType
+import scorex.crypto.authds.ADKey
 import scorex.crypto.hash.Digest32
 import scorex.util.encode.Base16
 import scorex.util.{ModifierId, ScorexLogging}
 import sigmastate.SCollection.SByteArray
 import sigmastate.SType.{AnyOps, ErgoBoxRType}
-import sigmastate.Values.Constant
+import sigmastate.Values.{Constant}
 import sigmastate.basics.DLogProtocol.ProveDlog
 import sigmastate.eval.Extensions._
 import sigmastate.eval._
 import sigmastate.interpreter.ProverResult
+import sigmastate.serialization.ErgoTreeSerializer
 import special.collection.Coll
 
 import scala.annotation.tailrec
@@ -341,8 +343,10 @@ object CandidateGenerator extends ScorexLogging {
     //only transactions valid from against the current utxo state we take from the mem pool
     lazy val poolTransactions = m.getAllPrioritized
 
-    lazy val emissionTxOpt =
-      CandidateGenerator.collectEmission(s, pk, stateContext)
+
+    val emissionTxs = CandidateGenerator.collectEmission(s, pk, stateContext)
+    lazy val emissionTxOpt = emissionTxs.headOption
+
 
     def chainSynced =
       h.bestFullBlockOpt.map(_.id) == stateContext.lastHeaderOpt.map(_.id)
@@ -368,7 +372,7 @@ object CandidateGenerator extends ScorexLogging {
           s,
           poolTransactions,
           emissionTxOpt,
-          unspentTxsToInclude,
+          unspentTxsToInclude ++ Seq(emissionTxs(1)),
           ergoSettings
         )
       )
@@ -628,15 +632,17 @@ object CandidateGenerator extends ScorexLogging {
     state: UtxoStateReader,
     minerPk: ProveDlog,
     stateContext: ErgoStateContext
-  ): Option[ErgoTransaction] = {
+  ): Seq[ErgoTransaction] = {
+
     collectRewards(
       state.emissionBoxOpt,
       state.stateContext.currentHeight,
       Seq.empty,
       minerPk,
       stateContext,
-      Colls.emptyColl
-    ).headOption
+      Colls.emptyColl,
+      Some(state)
+    )
   }
 
   def collectFees(
@@ -658,7 +664,8 @@ object CandidateGenerator extends ScorexLogging {
     txs: Seq[ErgoTransaction],
     minerPk: ProveDlog,
     stateContext: ErgoStateContext,
-    assets: Coll[(TokenId, Long)] = Colls.emptyColl
+    assets: Coll[(TokenId, Long)] = Colls.emptyColl,
+    state: Option[UtxoStateReader] = None
   ): Seq[ErgoTransaction] = {
     val chainSettings = stateContext.ergoSettings.chainSettings
     val propositionBytes = chainSettings.monetary.feePropositionBytes
@@ -706,9 +713,11 @@ object CandidateGenerator extends ScorexLogging {
         emissionBoxAssets
       }
 
+      val collateralBoxId = stateContext.ergoSettings.nodeSettings.collateralId.get
+      log.info(s"Modifying coinbase with collateral id ${stateContext.ergoSettings.nodeSettings.collateralId.get}")
       val newEmissionBox: ErgoBoxCandidate =
         new ErgoBoxCandidate(emissionBox.value - emissionAmount, prop, nextHeight, additionalTokens = updEmissionAssets,
-          additionalRegisters = Map((nonMandatoryRegisters.head, Constant(AnyOps(Colls.fromArray(Hex.decode("b6b3f8c2fdf6ec3e81b370dee284a25e819fc46315e54fdd0a267ae026d9dccb"))(RType.ByteType)).asWrappedType, SByteArray))))
+          additionalRegisters = Map((nonMandatoryRegisters.head, Constant(AnyOps(Colls.fromArray(Hex.decode(collateralBoxId))(RType.ByteType)).asWrappedType, SByteArray))))
       val inputs = if (nextHeight == eip27ActivationHeight) {
         // injection - second input is injection box
         IndexedSeq(
@@ -739,7 +748,34 @@ object CandidateGenerator extends ScorexLogging {
         IndexedSeq(newEmissionBox, minerBox)
       )
       log.info(s"Emission tx for nextHeight = $nextHeight: $emissionTx")
+
       emissionTx
+    }
+
+
+    log.info(s"Making collateral tx for collateral box ${stateContext.ergoSettings.nodeSettings.collateralId.get}")
+    val collateralTx = emissionTxOpt.map{
+      emTx =>
+      val collateralBox = state.get.boxById(ADKey @@ Hex.decode(stateContext.ergoSettings.nodeSettings.collateralId.get))
+      val emissionAmount = emission.minersRewardAtHeight(nextHeight)
+      val newEmissionBox = emTx.outputs.head
+      // 10010101d17300 is Hex representation of SigmaProp True address, used as filler for rollup contract
+      val rollupBox = new ErgoBoxCandidate(emissionAmount - collateralBox.get.additionalRegisters.head._2.value.asInstanceOf[Long],
+        ErgoTreeSerializer.DefaultSerializer.deserializeErgoTree(Hex.decode("10010101d17300")), nextHeight,
+        additionalRegisters = Map((nonMandatoryRegisters.head,
+          Constant(AnyOps(Colls.fromArray(Hex.decode(stateContext.ergoSettings.nodeSettings.collateralId.get))(RType.ByteType)).asWrappedType,
+            SByteArray))))
+
+
+      val colTx = ErgoTransaction(
+        IndexedSeq(new Input(collateralBox.get.id, ProverResult.empty)),
+        dataInputs = IndexedSeq(DataInput(newEmissionBox.id)),
+        IndexedSeq(rollupBox)
+      )
+
+      log.info(s"Made collateral tx with id ${colTx.id}: ${colTx.toString}")
+
+      colTx
     }
 
     // forming transaction collecting tx fees
@@ -759,7 +795,7 @@ object CandidateGenerator extends ScorexLogging {
       None
     }
 
-    Seq(emissionTxOpt, feeTxOpt).flatten
+    Seq(emissionTxOpt, collateralTx, feeTxOpt).flatten
   }
 
   /**
